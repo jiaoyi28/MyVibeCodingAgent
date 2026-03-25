@@ -1,9 +1,8 @@
 import subprocess
-from enum import Enum
 from typing import List
 
 from agent.utils import WORKSPACE, safe_path
-from agent.schema import Tool
+from agent.schema import Tool, ToolParameters, ToolProperty
 
 class ToolManager:
     """tool管理"""
@@ -27,8 +26,6 @@ class ToolManager:
         if tool_name not in self.tool_handlers:
             raise ValueError(f"Tool {tool_name} not found")
         return self.tool_handlers[tool_name](**kwargs)
-
-    
 
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -74,3 +71,83 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
+
+
+TOOL_SPECS = [
+    {
+        "name": "run_bash",
+        "description": "Run a bash command",
+        "properties": {
+            "command": ToolProperty(
+                type="string",
+                description="The command to run",
+            )
+        },
+        "required": ["command"],
+        "handler": run_bash,
+    },
+    {
+        "name": "run_edit",
+        "description": "Edit a file",
+        "properties": {
+            "path": ToolProperty(
+                type="string",
+                description="The path to the file",
+            ),
+            "old_text": ToolProperty(
+                type="string",
+                description="The old text",
+            ),
+            "new_text": ToolProperty(
+                type="string",
+                description="The new text",
+            ),
+        },
+        "required": ["path", "old_text", "new_text"],
+        "handler": run_edit,
+    },
+    {
+        "name": "run_read",
+        "description": "Read a file",
+        "properties": {
+            "path": ToolProperty(
+                type="string",
+                description="The path to the file",
+            )
+        },
+        "required": ["path"],
+        "handler": run_read,
+    },
+    {
+        "name": "run_write",
+        "description": "Write to a file",
+        "properties": {
+            "path": ToolProperty(
+                type="string",
+                description="The path to the file",
+            ),
+            "content": ToolProperty(
+                type="string",
+                description="The content to write",
+            ),
+        },
+        "required": ["path", "content"],
+        "handler": run_write,
+    },
+]
+
+
+def register_builtin_tools(tool_manager: ToolManager):
+    for spec in TOOL_SPECS:
+        tool_manager.register(
+            Tool(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=ToolParameters(
+                    type="object",
+                    properties=spec["properties"],
+                    required=spec["required"],
+                ),
+            ),
+            spec["handler"],
+        )

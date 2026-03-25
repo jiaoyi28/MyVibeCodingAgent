@@ -1,4 +1,4 @@
-from openai import APIConnectionError, APITimeoutError, OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from dotenv import load_dotenv
 import httpx
 import json
@@ -6,8 +6,7 @@ import logging
 import os
 from typing import Any, List
 from pathlib import Path
-from agent.tool import ToolManager, run_bash, run_edit, run_read, run_write
-from agent.schema import Tool, ToolParameters, ToolProperty
+from agent.tool import ToolManager, register_builtin_tools
 from agent.prompts import assemble_system_prompt
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -19,7 +18,7 @@ logger = logging.getLogger("myvibecodingagent")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s",
+        "%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(message)s",
         "%Y-%m-%d %H:%M:%S",
     )
 
@@ -56,12 +55,10 @@ class MyAgent:
         self._register_tools()
         self.system_prompt = assemble_system_prompt()
         self.messages = []
+        self.client_call_count = 0
 
     def _register_tools(self):
-        self.tool_manager.register(Tool(name="run_bash", description="Run a bash command", parameters=ToolParameters(type="object", properties={"command": ToolProperty(type="string", description="The command to run")}, required=["command"])), run_bash)
-        self.tool_manager.register(Tool(name="run_edit", description="Edit a file", parameters=ToolParameters(type="object", properties={"path": ToolProperty(type="string", description="The path to the file"), "old_text": ToolProperty(type="string", description="The old text"), "new_text": ToolProperty(type="string", description="The new text")}, required=["path", "old_text", "new_text"])), run_edit)
-        self.tool_manager.register(Tool(name="run_read", description="Read a file", parameters=ToolParameters(type="object", properties={"path": ToolProperty(type="string", description="The path to the file")}, required=["path"])), run_read)
-        self.tool_manager.register(Tool(name="run_write", description="Write to a file", parameters=ToolParameters(type="object", properties={"path": ToolProperty(type="string", description="The path to the file"), "content": ToolProperty(type="string", description="The content to write")}, required=["path", "content"])), run_write)
+        register_builtin_tools(self.tool_manager)
 
     def _parse_tool_arguments(self, arguments: Any) -> dict:
         if isinstance(arguments, dict):
@@ -73,14 +70,37 @@ class MyAgent:
             raise ValueError("Tool arguments JSON must decode to an object")
         raise TypeError(f"Unsupported tool arguments type: {type(arguments).__name__}")
 
-    def agent_loop(self, messages: List):
+    def _chat_tools(self) -> List[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                },
+            }
+            for tool in self.tool_manager.list_all()
+        ]
+
+    def _next_client_call_count(self) -> int:
+        self.client_call_count += 1
+        return self.client_call_count
+
+    def _chat_loop(self, messages: List):
+        # Compatible providers usually support chat.completions better than responses,
+        # so this loop keeps the full chat history and appends tool results back to it.
         while True:
             try:
-                response = self.client.responses.create(
+                call_count = self._next_client_call_count()
+                logger.debug(f"Calling model service via chat.completions, attempt #{call_count}")
+                response = self.client.chat.completions.create(
                     model=model,
-                    input=messages,
-                    instructions=self.system_prompt,
-                    tools=self.tool_manager.list_all(),
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        *messages,
+                    ],
+                    tools=self._chat_tools(),
                 )
             except APITimeoutError:
                 logger.error(
@@ -93,13 +113,99 @@ class MyAgent:
                     f"OpenAI connection failed: {exc}. Check your network, proxy, and OPENAI_BASE_URL."
                 )
                 return
-            logger.info(response.output)
+            except APIStatusError as exc:
+                logger.error(
+                    f"OpenAI request failed with status {exc.status_code}: {exc}"
+                )
+                return
+
+            message = response.choices[0].message
+            logger.debug(message)
+            tool_calls = message.tool_calls or []
+            if not tool_calls:
+                content = message.content or ""
+                logger.debug("No function calls found. Current agent loop is finished.")
+                logger.debug(f"message.content: {content}")
+                messages.append({"role": "assistant", "content": content})
+                return
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                        for tool_call in tool_calls
+                    ],
+                }
+            )
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                if not self.tool_manager.has_tool(tool_name):
+                    current_result = f"Tool {tool_name} not found. Skipping function call."
+                else:
+                    try:
+                        tool_args = self._parse_tool_arguments(tool_call.function.arguments)
+                        current_result = self.tool_manager.execute(tool_name, **tool_args)
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        current_result = f"Error parsing arguments for {tool_name}: {exc}"
+
+                logger.debug(f"Execute tool {tool_name}: {current_result}")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": current_result,
+                    }
+                )
+
+    def _responses_loop(self, messages: List):
+        # OpenAI native responses API uses previous_response_id plus
+        # function_call_output items to continue the tool-calling chain.
+        response_input = messages
+        previous_response_id = None
+        while True:
+            try:
+                call_count = self._next_client_call_count()
+                logger.debug(f"Calling model service via responses, attempt #{call_count}")
+                response = self.client.responses.create(
+                    model=model,
+                    input=response_input,
+                    instructions=self.system_prompt,
+                    tools=self.tool_manager.list_all(),
+                    previous_response_id=previous_response_id,
+                )
+            except APITimeoutError:
+                logger.error(
+                    "OpenAI request timed out. Check your network, proxy, and OPENAI_BASE_URL, "
+                    "or increase OPENAI_TIMEOUT_SECONDS / OPENAI_CONNECT_TIMEOUT_SECONDS."
+                )
+                return
+            except APIConnectionError as exc:
+                logger.error(
+                    f"OpenAI connection failed: {exc}. Check your network, proxy, and OPENAI_BASE_URL."
+                )
+                return
+            except APIStatusError as exc:
+                logger.error(
+                    f"OpenAI request failed with status {exc.status_code}: {exc}"
+                )
+                return
+            logger.debug(response.output)
             # messages.append({"role": "assistant", "content": response.output_text})
             function_calls = [item for item in response.output if item.type == "function_call"]
             if not function_calls:
-                logger.info("No function calls found. Current agent loop is finished.")
-                logger.info(f"response.output_text: {response.output_text}")
-                messages.append({"role": "assistant", "content": response.output_text})
+                logger.debug("No function calls found. Current agent loop is finished.")
+                logger.debug(f"response.output_text: {response.output_text}")
+                messages.append({"role": "assistant", "content": response.output_text or ""})
                 return
             
             tool_use_results = []
@@ -113,10 +219,19 @@ class MyAgent:
                         current_result = self.tool_manager.execute(tool_name, **tool_args)
                     except (json.JSONDecodeError, TypeError, ValueError) as exc:
                         current_result = f"Error parsing arguments for {tool_name}: {exc}"
-                logger.info(f"Execute tool {tool_name}: {current_result}")
+                logger.debug(f"Execute tool {tool_name}: {current_result}")
                 tool_use_results.append({"type": "function_call_output", "call_id": function_call.id, "output": current_result})
-            logger.info(f"tool use results: {tool_use_results}")
-            messages += tool_use_results
+            logger.debug(f"tool use results: {tool_use_results}")
+            response_input = tool_use_results
+            previous_response_id = response.id
+
+    def agent_loop(self, messages: List):
+        if base_url:
+            # 三方兼容的base_url，通常不会兼容openai sdk最新的responses，但是会兼容原有的chat.completions
+            # 这两个用法稍有不同
+            self._chat_loop(messages)
+            return
+        self._responses_loop(messages)
 
 
 
