@@ -18,7 +18,7 @@ class ToolManager:
 
 
     def list_all(self) -> List:
-        return list(self.tools.values())
+        return [tool.to_dict() for tool in self.tools.values()]
     
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self.tool_handlers

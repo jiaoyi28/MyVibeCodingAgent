@@ -54,15 +54,3 @@ class Tool:
             "description": self.description,
             "parameters": self.parameters.to_dict(),
         }
-
-
-@dataclass
-class Message:
-    role: str
-    content: str
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "role": self.role,
-            "content": self.content,
-        }

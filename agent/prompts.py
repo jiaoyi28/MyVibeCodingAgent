@@ -11,3 +11,4 @@ SYSTEM_PROMPT_ENVIRONMENT_SECTION = f"The current time is {now_time}. You are ru
 def assemble_system_prompt():
     system_prompt = SYSTEM_PROMPT_ROLE_SECTION + "\n"
     system_prompt += SYSTEM_PROMPT_ENVIRONMENT_SECTION
+    return system_prompt
