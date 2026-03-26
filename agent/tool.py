@@ -27,6 +27,46 @@ class ToolManager:
             raise ValueError(f"Tool {tool_name} not found")
         return self.tool_handlers[tool_name](**kwargs)
 
+class ToDoManager:
+    def __init__(self, capacity: int = 10) -> None:
+        self.todo_list = []
+        self.capacity = capacity
+    
+    def update(self, todos: List) -> None:
+        if len(todos) > self.capacity:
+            raise ValueError("Exceed todo capacity")
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(todos):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.todo_list = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.todo_list:
+            return "No todos."
+        lines = []
+        for item in self.todo_list:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.todo_list if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.todo_list)} completed)")
+        return "\n".join(lines)
+
+to_do_manager = ToDoManager()
+
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -74,6 +114,17 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_SPECS = [
+    {
+        "name": "todo",
+        "description": "Update todo task list. Track progress on multi-step tasks.",
+        "properties": {
+            "todos": ToolProperty(
+                type="array",
+                description="The todos to manage",
+            )
+        },
+        "required": ["todos"],
+    },
     {
         "name": "run_bash",
         "description": "Run a bash command",
