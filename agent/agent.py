@@ -9,7 +9,7 @@ import time
 from typing import Any, List
 from pathlib import Path
 from agent.tool import ToolManager, register_builtin_tools
-from agent.prompts import assemble_system_prompt
+from agent.prompts import assemble_exploration_subagent_system_prompt, assemble_system_prompt
 
 PROJECT_ROOT = Path(__file__).parent.parent
 LOG_PATH = PROJECT_ROOT / "log.txt"
@@ -63,6 +63,7 @@ client = OpenAI(
 )
 
 class LoopAgent:
+    role = "main_agent"
     """
     提供统一的对外入口：`agent_loop(messages)`。
     内部通过子类实现不同的调用形态：
@@ -314,6 +315,20 @@ class ResponsesOutputLoopAgent(LoopAgent):
             logger.debug(f"tool use results: {tool_use_results}")
             response_input = tool_use_results
             previous_response_id = response.id
+
+class ExplorationSubAgent():
+    role = "sub_agent"
+
+    def __init__(self, client: OpenAI, tool_manager: ToolManager):
+        self.client = client
+        self.tool_manager = tool_manager
+        self.model = model
+        self.system_prompt = assemble_exploration_subagent_system_prompt()
+        self.client_call_count = 0
+        
+
+    def invoke(self, messages: List, max_loop = 10) -> str:
+        pass
 
 
 if __name__ == "__main__":

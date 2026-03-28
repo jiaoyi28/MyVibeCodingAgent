@@ -6,11 +6,18 @@ from agent.utils import WORKSPACE, safe_path
 from agent.schema import JsonSchema, Tool, ToolParameters
 
 class ToolManager:
+    _instance = None
+
     """tool管理"""
 
     def __init__(self) -> None:
         self.tools = {}
         self.tool_handlers = {}
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def register(self, tool: Tool, tool_handler):
         self.tools[tool.name] = tool
