@@ -5,6 +5,7 @@ import httpx
 import json
 import logging
 import os
+import time
 from typing import Any, List
 from pathlib import Path
 from agent.tool import ToolManager, register_builtin_tools
@@ -15,23 +16,34 @@ LOG_PATH = PROJECT_ROOT / "log.txt"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
+class TerminalLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return getattr(record, "send_to_terminal", True)
+
 logger = logging.getLogger("myvibecodingagent")
+terminal_logger = logging.getLogger("myvibecodingagent.terminal")
 if not logger.handlers:
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(message)s",
         "%Y-%m-%d %H:%M:%S",
     )
 
     file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
     stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.addFilter(TerminalLogFilter())
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
+    terminal_logger.setLevel(logging.INFO)
+    terminal_logger.addHandler(stream_handler)
 
 logger.propagate = False
+terminal_logger.propagate = False
 
 
 
@@ -80,6 +92,48 @@ class LoopAgent:
         self.client_call_count += 1
         return self.client_call_count
 
+    def _serialize_for_log(self, value: Any, max_length: int = 12000) -> str:
+        try:
+            if hasattr(value, "model_dump"):
+                value = value.model_dump()
+            serialized = json.dumps(value, ensure_ascii=False, default=str, indent=2)
+        except TypeError:
+            serialized = str(value)
+
+        if len(serialized) <= max_length:
+            return serialized
+        return f"{serialized[:max_length]}... (truncated {len(serialized) - max_length} chars)"
+
+    def _log_model_request(self, api_name: str, call_count: int, payload: dict) -> None:
+        logger.debug(
+            "Model request | api=%s | attempt=%s | payload=%s",
+            api_name,
+            call_count,
+            self._serialize_for_log(payload),
+        )
+
+    def _log_model_response(
+        self, api_name: str, call_count: int, started_at: float, response: Any
+    ) -> None:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        logger.debug(
+            "Model response | api=%s | attempt=%s | elapsed_ms=%.2f | payload=%s",
+            api_name,
+            call_count,
+            elapsed_ms,
+            self._serialize_for_log(response),
+        )
+
+    def _log_tool_call(self, tool_name: str, tool_args: Any, result: str) -> None:
+        logger.info(
+            "Tool call | name=%s | input=%s | output=%s",
+            tool_name,
+            self._serialize_for_log(tool_args),
+            self._serialize_for_log(result),
+            extra={"send_to_terminal": False},
+        )
+        terminal_logger.info(">%s: %s", tool_name, result)
+
     def _parse_tool_arguments(self, arguments: Any) -> dict:
         if isinstance(arguments, dict):
             return arguments
@@ -92,13 +146,19 @@ class LoopAgent:
 
     def _execute_tool(self, tool_name: str, arguments: Any) -> str:
         if not self.tool_manager.has_tool(tool_name):
-            return f"Tool {tool_name} not found. Skipping function call."
+            result = f"Tool {tool_name} not found. Skipping function call."
+            self._log_tool_call(tool_name, arguments, result)
+            return result
 
         try:
             tool_args = self._parse_tool_arguments(arguments)
-            return self.tool_manager.execute(tool_name, **tool_args)
+            result = self.tool_manager.execute(tool_name, **tool_args)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            return f"Error parsing arguments for {tool_name}: {exc}"
+            tool_args = arguments
+            result = f"Error parsing arguments for {tool_name}: {exc}"
+
+        self._log_tool_call(tool_name, tool_args, result)
+        return result
 
     def agent_loop(self, messages: List):
         self._agent_loop(messages)
@@ -125,17 +185,22 @@ class ChatCompletionLoopAgent(LoopAgent):
         # Compatible providers usually support chat.completions better than responses,
         # so this loop keeps the full chat history and appends tool results back to it.
         while True:
+            call_count = self._next_client_call_count()
+            request_payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    *messages,
+                ],
+                "tools": self._chat_tools(),
+            }
+            started_at = time.perf_counter()
+            self._log_model_request("chat.completions", call_count, request_payload)
             try:
-                call_count = self._next_client_call_count()
-                logger.debug(f"Calling model service via chat.completions, attempt #{call_count}")
                 response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        *messages,
-                    ],
-                    tools=self._chat_tools(),
+                    **request_payload,
                 )
+                self._log_model_response("chat.completions", call_count, started_at, response)
             except APITimeoutError:
                 logger.error(
                     "OpenAI request timed out. Check your network, proxy, and OPENAI_BASE_URL, "
@@ -182,7 +247,6 @@ class ChatCompletionLoopAgent(LoopAgent):
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 current_result = self._execute_tool(tool_name, tool_call.function.arguments)
-                logger.debug(f"Execute tool {tool_name}: {current_result}")
                 messages.append(
                     {
                         "role": "tool",
@@ -199,16 +263,21 @@ class ResponsesOutputLoopAgent(LoopAgent):
         response_input = messages
         previous_response_id = None
         while True:
+            call_count = self._next_client_call_count()
+            request_payload = {
+                "model": self.model,
+                "input": response_input,
+                "instructions": self.system_prompt,
+                "tools": self.tool_manager.list_all(),
+                "previous_response_id": previous_response_id,
+            }
+            started_at = time.perf_counter()
+            self._log_model_request("responses", call_count, request_payload)
             try:
-                call_count = self._next_client_call_count()
-                logger.debug(f"Calling model service via responses, attempt #{call_count}")
                 response = self.client.responses.create(
-                    model=self.model,
-                    input=response_input,
-                    instructions=self.system_prompt,
-                    tools=self.tool_manager.list_all(),
-                    previous_response_id=previous_response_id,
+                    **request_payload,
                 )
+                self._log_model_response("responses", call_count, started_at, response)
             except APITimeoutError:
                 logger.error(
                     "OpenAI request timed out. Check your network, proxy, and OPENAI_BASE_URL, "
@@ -235,7 +304,6 @@ class ResponsesOutputLoopAgent(LoopAgent):
             tool_use_results = []
             for function_call in function_calls:
                 current_result = self._execute_tool(function_call.name, function_call.arguments)
-                logger.debug(f"Execute tool {function_call.name}: {current_result}")
                 tool_use_results.append(
                     {
                         "type": "function_call_output",

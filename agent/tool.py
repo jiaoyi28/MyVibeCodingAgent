@@ -121,9 +121,31 @@ TOOL_SPECS = [
             "todos": ToolProperty(
                 type="array",
                 description="The todos to manage",
+                items=ToolProperty(
+                    type="object",
+                    description="A todo item",
+                    properties={
+                        "id": ToolProperty(
+                            type="string",
+                            description="The todo item id",
+                        ),
+                        "text": ToolProperty(
+                            type="string",
+                            description="The todo item text",
+                        ),
+                        "status": ToolProperty(
+                            type="string",
+                            description="The todo item status",
+                            enum=["pending", "in_progress", "completed"],
+                        ),
+                    },
+                    required=["text"],
+                ),
+                max_items=10,
             )
         },
         "required": ["todos"],
+        "handler": to_do_manager.update,
     },
     {
         "name": "run_bash",
