@@ -40,12 +40,16 @@ agent/
 ## 已实现能力
 
 - 定义基础消息结构 `Message`
-- 定义接近 OpenAI tools 格式的 `Tool` / `ToolParameters` / `ToolProperty`
+- 定义更通用的 `JsonSchema` / `Tool` 数据结构
+- 保留 `ToolParameters` / `ToolProperty` 作为兼容别名
+- 支持输出 OpenAI `parameters` 风格，以及 `input_schema` 风格的工具 schema
+- 通过声明式 `BuiltinToolSpec` 注册内置工具，新增工具时只需补充 schema 和 handler
 - 注册本地工具：
-  - `run_bash`
-  - `run_read`
-  - `run_write`
-  - `run_edit`
+  - `bash`
+  - `read_file`
+  - `write_file`
+  - `edit_file`
+  - `todo`
 - 对工作区文件路径进行简单越界保护
 
 ## 快速安装
@@ -62,6 +66,6 @@ pip install python-dotenv
 建议按下面顺序继续完善：
 
 1. 先修复 `agent.py` 与 `prompts.py` 中会导致主流程无法运行的问题。
-2. 统一 `Message` 和 `Tool` 的序列化方式，保证传给 OpenAI SDK 的都是标准字典。
-3. 正确处理 tool call arguments 的 JSON 解析与 tool result 回传格式。
+2. 继续统一 `Message` 和 `Tool` 的序列化边界，减少不同 API 分支中的重复适配代码。
+3. 为工具参数校验、tool call arguments 的 JSON 解析与 tool result 回传补充更完整的错误处理。
 4. 再补充 `mcp.py`、`skill.py` 与更完整的 README 示例。

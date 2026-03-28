@@ -1,8 +1,9 @@
 import subprocess
-from typing import List
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Mapping
 
 from agent.utils import WORKSPACE, safe_path
-from agent.schema import Tool, ToolParameters, ToolProperty
+from agent.schema import JsonSchema, Tool, ToolParameters
 
 class ToolManager:
     """tool管理"""
@@ -32,12 +33,12 @@ class ToDoManager:
         self.todo_list = []
         self.capacity = capacity
     
-    def update(self, todos: List) -> None:
-        if len(todos) > self.capacity:
+    def update(self, items: List) -> None:
+        if len(items) > self.capacity:
             raise ValueError("Exceed todo capacity")
         validated = []
         in_progress_count = 0
-        for i, item in enumerate(todos):
+        for i, item in enumerate(items):
             text = str(item.get("text", "")).strip()
             status = str(item.get("status", "pending")).lower()
             item_id = str(item.get("id", str(i + 1)))
@@ -67,7 +68,64 @@ class ToDoManager:
 to_do_manager = ToDoManager()
 
 
-def run_bash(command: str) -> str:
+ToolHandler = Callable[..., str]
+
+SCHEMA_KEY_MAP = {
+    "minItems": "min_items",
+    "maxItems": "max_items",
+    "minLength": "min_length",
+    "maxLength": "max_length",
+    "additionalProperties": "additional_properties",
+    "oneOf": "one_of",
+    "anyOf": "any_of",
+    "allOf": "all_of",
+}
+
+
+def schema_from_dict(data: Mapping[str, Any], *, root: bool = False) -> JsonSchema:
+    kwargs: dict[str, Any] = {}
+    for key, value in data.items():
+        normalized_key = SCHEMA_KEY_MAP.get(key, key)
+        if key == "properties":
+            kwargs["properties"] = {
+                name: schema_from_dict(schema_data) for name, schema_data in value.items()
+            }
+        elif key == "items":
+            if isinstance(value, list):
+                kwargs["items"] = [schema_from_dict(item) for item in value]
+            else:
+                kwargs["items"] = schema_from_dict(value)
+        elif key in {"oneOf", "anyOf", "allOf"}:
+            kwargs[normalized_key] = [schema_from_dict(item) for item in value]
+        elif key == "additionalProperties" and isinstance(value, Mapping):
+            kwargs["additional_properties"] = schema_from_dict(value)
+        else:
+            kwargs[normalized_key] = value
+    schema_cls = ToolParameters if root else JsonSchema
+    return schema_cls(**kwargs)
+
+
+@dataclass(frozen=True)
+class BuiltinToolSpec:
+    name: str
+    description: str
+    input_schema: JsonSchema | Mapping[str, Any]
+    handler: ToolHandler
+
+    def schema(self) -> JsonSchema:
+        if isinstance(self.input_schema, JsonSchema):
+            return self.input_schema
+        return schema_from_dict(self.input_schema, root=True)
+
+    def build_tool(self, *, name: str | None = None) -> Tool:
+        return Tool(
+            name=name or self.name,
+            description=self.description,
+            parameters=self.schema(),
+        )
+
+
+def bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -80,7 +138,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
-def run_read(path: str, limit: int = None) -> str:
+def read_file(path: str, limit: int = None) -> str:
     try:
         text = safe_path(path).read_text()
         lines = text.splitlines()
@@ -91,7 +149,7 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 
-def run_write(path: str, content: str) -> str:
+def write_file(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -101,7 +159,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+def edit_file(path: str, old_text: str, new_text: str) -> str:
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -114,113 +172,122 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_SPECS = [
-    {
-        "name": "todo",
-        "description": "Update todo task list. Track progress on multi-step tasks.",
-        "properties": {
-            "todos": ToolProperty(
-                type="array",
-                description="The todos to manage",
-                items=ToolProperty(
-                    type="object",
-                    description="A todo item",
-                    properties={
-                        "id": ToolProperty(
-                            type="string",
-                            description="The todo item id",
-                        ),
-                        "text": ToolProperty(
-                            type="string",
-                            description="The todo item text",
-                        ),
-                        "status": ToolProperty(
-                            type="string",
-                            description="The todo item status",
-                            enum=["pending", "in_progress", "completed"],
-                        ),
+    BuiltinToolSpec(
+        name="bash",
+        description="Run a shell command.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command to run.",
+                }
+            },
+            "required": ["command"],
+        },
+        handler=bash,
+    ),
+    BuiltinToolSpec(
+        name="read_file",
+        description="Read file contents.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path of the file to read.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional max number of lines to read.",
+                    "minimum": 1,
+                },
+            },
+            "required": ["path"],
+        },
+        handler=read_file,
+    ),
+    BuiltinToolSpec(
+        name="write_file",
+        description="Write content to file.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path of the file to write.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write.",
+                },
+            },
+            "required": ["path", "content"],
+        },
+        handler=write_file,
+    ),
+    BuiltinToolSpec(
+        name="edit_file",
+        description="Replace exact text in file.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path of the file to edit.",
+                },
+                "old_text": {
+                    "type": "string",
+                    "description": "The exact text to replace.",
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "The replacement text.",
+                },
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+        handler=edit_file,
+    ),
+    BuiltinToolSpec(
+        name="todo",
+        description="Update task list. Track progress on multi-step tasks.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "The todo items to manage.",
+                    "items": {
+                        "type": "object",
+                        "description": "A todo item.",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "The todo item id.",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "The todo item text.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "The todo item status.",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["text"],
                     },
-                    required=["text"],
-                ),
-                max_items=10,
-            )
+                    "maxItems": 10,
+                }
+            },
+            "required": ["items"],
         },
-        "required": ["todos"],
-        "handler": to_do_manager.update,
-    },
-    {
-        "name": "run_bash",
-        "description": "Run a bash command",
-        "properties": {
-            "command": ToolProperty(
-                type="string",
-                description="The command to run",
-            )
-        },
-        "required": ["command"],
-        "handler": run_bash,
-    },
-    {
-        "name": "run_edit",
-        "description": "Edit a file",
-        "properties": {
-            "path": ToolProperty(
-                type="string",
-                description="The path to the file",
-            ),
-            "old_text": ToolProperty(
-                type="string",
-                description="The old text",
-            ),
-            "new_text": ToolProperty(
-                type="string",
-                description="The new text",
-            ),
-        },
-        "required": ["path", "old_text", "new_text"],
-        "handler": run_edit,
-    },
-    {
-        "name": "run_read",
-        "description": "Read a file",
-        "properties": {
-            "path": ToolProperty(
-                type="string",
-                description="The path to the file",
-            )
-        },
-        "required": ["path"],
-        "handler": run_read,
-    },
-    {
-        "name": "run_write",
-        "description": "Write to a file",
-        "properties": {
-            "path": ToolProperty(
-                type="string",
-                description="The path to the file",
-            ),
-            "content": ToolProperty(
-                type="string",
-                description="The content to write",
-            ),
-        },
-        "required": ["path", "content"],
-        "handler": run_write,
-    },
+        handler=to_do_manager.update,
+    ),
 ]
 
 
 def register_builtin_tools(tool_manager: ToolManager):
     for spec in TOOL_SPECS:
-        tool_manager.register(
-            Tool(
-                name=spec["name"],
-                description=spec["description"],
-                parameters=ToolParameters(
-                    type="object",
-                    properties=spec["properties"],
-                    required=spec["required"],
-                ),
-            ),
-            spec["handler"],
-        )
+        tool_manager.register(spec.build_tool(), spec.handler)
