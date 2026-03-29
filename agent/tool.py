@@ -1,9 +1,15 @@
+import fnmatch
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Mapping
 
 from agent.utils import WORKSPACE, safe_path
 from agent.schema import JsonSchema, Tool, ToolParameters
+
+ROLE_VISIBLE_TOOL_NAMES = {
+    "sub_agent": {"glob", "grep", "read_file"},
+}
 
 class ToolManager:
     _instance = None
@@ -24,8 +30,20 @@ class ToolManager:
         self.tool_handlers[tool.name] = tool_handler
 
 
-    def list_all(self) -> List:
-        return [tool.to_dict() for tool in self.tools.values()]
+    def _is_tool_visible(self, tool_name: str, role: str | None = None) -> bool:
+        if not role or role == "main_agent":
+            return True
+        visible_tool_names = ROLE_VISIBLE_TOOL_NAMES.get(role)
+        if visible_tool_names is None:
+            return True
+        return tool_name in visible_tool_names
+
+    def list_all(self, role: str | None = None) -> List:
+        return [
+            tool.to_dict()
+            for tool in self.tools.values()
+            if self._is_tool_visible(tool.name, role)
+        ]
     
     def has_tool(self, tool_name: str) -> bool:
         return tool_name in self.tool_handlers
@@ -156,6 +174,74 @@ def read_file(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 
+def _workspace_relative_path(path) -> str:
+    return str(path.relative_to(WORKSPACE)).replace("\\", "/")
+
+
+def glob(pattern: str, base_path: str = ".") -> str:
+    try:
+        if not str(pattern).strip():
+            return "Error: pattern is required"
+
+        root = safe_path(base_path)
+        matches = sorted(
+            [
+                _workspace_relative_path(path)
+                for path in root.rglob("*")
+                if fnmatch.fnmatch(path.name, pattern)
+                or fnmatch.fnmatch(str(path.relative_to(root)).replace("\\", "/"), pattern)
+            ]
+        )
+        if not matches:
+            return "No matches found."
+        if len(matches) > 200:
+            matches = matches[:200] + [f"... ({len(matches) - 200} more matches)"]
+        return "\n".join(matches)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def grep(
+    pattern: str,
+    base_path: str = ".",
+    file_pattern: str = "*",
+    case_sensitive: bool = False,
+) -> str:
+    try:
+        if not str(pattern).strip():
+            return "Error: pattern is required"
+
+        root = safe_path(base_path)
+        regex = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+        results = []
+
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            relative_to_root = str(path.relative_to(root)).replace("\\", "/")
+            if not fnmatch.fnmatch(path.name, file_pattern) and not fnmatch.fnmatch(
+                relative_to_root, file_pattern
+            ):
+                continue
+
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except UnicodeDecodeError:
+                lines = path.read_text(errors="ignore").splitlines()
+
+            for line_no, line in enumerate(lines, start=1):
+                if regex.search(line):
+                    relative_path = _workspace_relative_path(path)
+                    results.append(f"{relative_path}:{line_no}:{line}")
+                    if len(results) >= 200:
+                        results.append("... (more matches)")
+                        return "\n".join(results)[:50000]
+
+        return "\n".join(results)[:50000] if results else "No matches found."
+    except re.error as e:
+        return f"Error: invalid regex pattern: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def write_file(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -174,6 +260,25 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
             return f"Error: Text not found in {path}"
         fp.write_text(content.replace(old_text, new_text, 1))
         return f"Edited {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def spawn_exploration_subagent(task: str, max_loop: int = 10) -> str:
+    if not str(task).strip():
+        return "Error: task is required"
+    if max_loop < 1:
+        return "Error: max_loop must be at least 1"
+
+    try:
+        from agent.agent import ExplorationSubAgent, client
+
+        tool_manager = ToolManager()
+        subagent = ExplorationSubAgent(client, tool_manager)
+        return subagent.invoke(
+            messages=[{"role": "user", "content": task}],
+            max_loop=max_loop,
+        )
     except Exception as e:
         return f"Error: {e}"
 
@@ -213,6 +318,56 @@ TOOL_SPECS = [
             "required": ["path"],
         },
         handler=read_file,
+    ),
+    BuiltinToolSpec(
+        name="glob",
+        description="Find files by glob pattern.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match files, such as '*.py' or 'agent/*.py'.",
+                },
+                "base_path": {
+                    "type": "string",
+                    "description": "Optional base directory to search from.",
+                    "default": ".",
+                },
+            },
+            "required": ["pattern"],
+        },
+        handler=glob,
+    ),
+    BuiltinToolSpec(
+        name="grep",
+        description="Search file contents with a regex pattern.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for.",
+                },
+                "base_path": {
+                    "type": "string",
+                    "description": "Optional base directory to search from.",
+                    "default": ".",
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "Optional glob for files to include, such as '*.py'.",
+                    "default": "*",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Whether the regex search is case-sensitive.",
+                    "default": False,
+                },
+            },
+            "required": ["pattern"],
+        },
+        handler=grep,
     ),
     BuiltinToolSpec(
         name="write_file",
@@ -291,6 +446,27 @@ TOOL_SPECS = [
             "required": ["items"],
         },
         handler=to_do_manager.update,
+    ),
+    BuiltinToolSpec(
+        name="spawn_exploration_subagent",
+        description="Spawn an exploration subagent for read-only research and return its summary.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The exploration task to delegate.",
+                },
+                "max_loop": {
+                    "type": "integer",
+                    "description": "Optional max model-call loops for the subagent.",
+                    "minimum": 1,
+                    "default": 10,
+                },
+            },
+            "required": ["task"],
+        },
+        handler=spawn_exploration_subagent,
     ),
 ]
 

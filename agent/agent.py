@@ -162,9 +162,9 @@ class LoopAgent:
         return result
 
     def agent_loop(self, messages: List):
-        self._agent_loop(messages)
+        return self._agent_loop(messages)
 
-    def _agent_loop(self, messages: List):
+    def _agent_loop(self, messages: List, max_loop: int | None = None):
         raise NotImplementedError
 
 
@@ -179,13 +179,18 @@ class ChatCompletionLoopAgent(LoopAgent):
                     "parameters": tool["parameters"],
                 },
             }
-            for tool in self.tool_manager.list_all()
+            for tool in self.tool_manager.list_all(role=self.role)
         ]
 
-    def _agent_loop(self, messages: List):
+    def _agent_loop(self, messages: List, max_loop: int | None = None):
         # Compatible providers usually support chat.completions better than responses,
         # so this loop keeps the full chat history and appends tool results back to it.
+        loop_count = 0
         while True:
+            if max_loop is not None and loop_count >= max_loop:
+                logger.warning("Max loop count reached before assistant produced a final summary.")
+                return "Stopped after reaching max_loop before producing a final summary."
+            loop_count += 1
             call_count = self._next_client_call_count()
             request_payload = {
                 "model": self.model,
@@ -225,7 +230,7 @@ class ChatCompletionLoopAgent(LoopAgent):
                 logger.debug("No function calls found. Current agent loop is finished.")
                 logger.debug(f"message.content: {content}")
                 messages.append({"role": "assistant", "content": content})
-                return
+                return content
 
             messages.append(
                 {
@@ -258,18 +263,23 @@ class ChatCompletionLoopAgent(LoopAgent):
 
 
 class ResponsesOutputLoopAgent(LoopAgent):
-    def _agent_loop(self, messages: List):
+    def _agent_loop(self, messages: List, max_loop: int | None = None):
         # OpenAI native responses API uses previous_response_id plus
         # function_call_output items to continue the tool-calling chain.
         response_input = messages
         previous_response_id = None
+        loop_count = 0
         while True:
+            if max_loop is not None and loop_count >= max_loop:
+                logger.warning("Max loop count reached before assistant produced a final summary.")
+                return "Stopped after reaching max_loop before producing a final summary."
+            loop_count += 1
             call_count = self._next_client_call_count()
             request_payload = {
                 "model": self.model,
                 "input": response_input,
                 "instructions": self.system_prompt,
-                "tools": self.tool_manager.list_all(),
+                "tools": self.tool_manager.list_all(role=self.role),
                 "previous_response_id": previous_response_id,
             }
             started_at = time.perf_counter()
@@ -300,7 +310,7 @@ class ResponsesOutputLoopAgent(LoopAgent):
                 logger.debug("No function calls found. Current agent loop is finished.")
                 logger.debug(f"response.output_text: {response.output_text}")
                 messages.append({"role": "assistant", "content": response.output_text or ""})
-                return
+                return response.output_text or ""
 
             tool_use_results = []
             for function_call in function_calls:
@@ -316,19 +326,15 @@ class ResponsesOutputLoopAgent(LoopAgent):
             response_input = tool_use_results
             previous_response_id = response.id
 
-class ExplorationSubAgent():
+class ExplorationSubAgent(ChatCompletionLoopAgent):
     role = "sub_agent"
 
     def __init__(self, client: OpenAI, tool_manager: ToolManager):
-        self.client = client
-        self.tool_manager = tool_manager
-        self.model = model
+        super().__init__(client, tool_manager)
         self.system_prompt = assemble_exploration_subagent_system_prompt()
-        self.client_call_count = 0
-        
 
     def invoke(self, messages: List, max_loop = 10) -> str:
-        pass
+        return self._agent_loop(messages, max_loop=max_loop)
 
 
 if __name__ == "__main__":
