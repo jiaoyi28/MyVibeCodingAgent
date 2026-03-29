@@ -1,7 +1,7 @@
 from pathlib import Path
 
 USER_HOME = Path.home()
-WORKSPACE = Path.cwd()
+WORKSPACE = Path(__file__).parent.parent
 
 def safe_path(p: str) -> Path:
     path = (WORKSPACE / p).resolve()

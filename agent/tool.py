@@ -3,9 +3,13 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Mapping
+from logging import getLogger
 
 from agent.utils import WORKSPACE, safe_path
 from agent.schema import JsonSchema, Tool, ToolParameters
+from agent.skill import SkillManager
+
+logger = getLogger("myvibecodingagent")
 
 ROLE_VISIBLE_TOOL_NAMES = {
     "sub_agent": {"glob", "grep", "read_file"},
@@ -90,7 +94,7 @@ class ToDoManager:
         lines.append(f"\n({done}/{len(self.todo_list)} completed)")
         return "\n".join(lines)
 
-to_do_manager = ToDoManager()
+TO_DO_MANAGER = ToDoManager()
 
 
 ToolHandler = Callable[..., str]
@@ -283,6 +287,14 @@ def spawn_exploration_subagent(task: str, max_loop: int = 10) -> str:
         return f"Error: {e}"
 
 
+def load_skill(name: str) -> str:
+    if not str(name).strip():
+        err = "load_skill: name is required"
+        logger.error(err)
+        return err
+    return SkillManager().get_content(name)
+
+
 TOOL_SPECS = [
     BuiltinToolSpec(
         name="bash",
@@ -445,7 +457,7 @@ TOOL_SPECS = [
             },
             "required": ["items"],
         },
-        handler=to_do_manager.update,
+        handler=TO_DO_MANAGER.update,
     ),
     BuiltinToolSpec(
         name="spawn_exploration_subagent",
@@ -468,6 +480,21 @@ TOOL_SPECS = [
         },
         handler=spawn_exploration_subagent,
     ),
+    BuiltinToolSpec(
+        name="load_skill",
+        description="Load specialized skill and knowledge by name.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name of the skill to load.",
+                }
+            },
+            "required": ["name"],
+        },
+        handler=load_skill
+    )
 ]
 
 

@@ -2,9 +2,11 @@ from pathlib import Path
 import re
 import logging
 
+from agent.utils import WORKSPACE
+
 logger = logging.getLogger("myvibecodingagent")
 
-DEFAULT_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+DEFAULT_SKILLS_DIR = WORKSPACE / "skills"
 
 class SkillManager:
     def __init__(self, skills_dir: Path = DEFAULT_SKILLS_DIR):
