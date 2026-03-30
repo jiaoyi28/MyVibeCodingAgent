@@ -1,7 +1,12 @@
 import fnmatch
+import os
+import platform
 import re
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, List, Mapping
 from logging import getLogger
 
@@ -48,6 +53,10 @@ class ToolManager:
     def execute(self, tool_name: str, **kwargs):
         if tool_name not in self.tool_handlers:
             raise ValueError(f"Tool {tool_name} not found")
+        tool = self.tools.get(tool_name)
+        if tool and tool.parameters.properties:
+            allowed = set(tool.parameters.properties)
+            kwargs = {k: v for k, v in kwargs.items() if k in allowed}
         return self.tool_handlers[tool_name](**kwargs)
 
 class ToDoManager:
@@ -144,17 +153,106 @@ class BuiltinToolSpec:
         )
 
 
-def bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
+IS_WINDOWS = sys.platform == "win32"
+
+_DANGEROUS_UNIX = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+_DANGEROUS_WIN = [
+    "format c:", "format d:",
+    "rd /s /q c:\\", "del /f /s /q c:\\",
+    "reg delete", "bcdedit",
+]
+
+
+def _is_wsl_bash(path: str) -> bool:
+    """Return True if *path* points to the WSL bash.exe wrapper."""
+    normalized = os.path.normcase(os.path.realpath(path))
+    return "system32" in normalized or "sysnative" in normalized
+
+
+def _get_shell() -> tuple[str | None, list[str]]:
+    """Return (shell_path, argv_prefix) for the best available shell."""
+    if not IS_WINDOWS:
+        for sh in ("/bin/bash", "/bin/sh"):
+            if os.path.isfile(sh):
+                return sh, [sh, "-c"]
+        return None, []
+
+    # Prefer Git Bash at well-known locations before shutil.which,
+    # because which("bash") often returns the WSL wrapper at System32.
+    _GIT_BASH_CANDIDATES = [
+        os.path.expandvars(r"%ProgramFiles%\Git\bin\bash.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Git\bin\bash.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe"),
+    ]
+    for candidate in _GIT_BASH_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate, [candidate, "-c"]
+
+    found_bash = shutil.which("bash")
+    if found_bash and not _is_wsl_bash(found_bash):
+        return found_bash, [found_bash, "-c"]
+
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if pwsh:
+        return pwsh, [pwsh, "-NoProfile", "-Command"]
+
+    return None, []
+
+
+def detect_shell_name() -> str:
+    """Return a human-readable name for the shell selected by _get_shell()."""
+    shell_exe, _ = _get_shell()
+    if shell_exe is None:
+        return "cmd.exe" if IS_WINDOWS else "sh"
+    lower = shell_exe.lower()
+    if "bash" in lower:
+        return "bash (Git Bash)" if IS_WINDOWS else "bash"
+    if "pwsh" in lower or "powershell" in lower:
+        return "powershell"
+    return shell_exe
+
+
+def _is_dangerous(command: str) -> bool:
+    cmd_lower = command.lower()
+    for d in _DANGEROUS_UNIX:
+        if d in cmd_lower:
+            return True
+    if IS_WINDOWS:
+        for d in _DANGEROUS_WIN:
+            if d.lower() in cmd_lower:
+                return True
+    return False
+
+
+def run_command(command: str) -> str:
+    if _is_dangerous(command):
         return "Error: Dangerous command blocked"
+
+    shell_exe, prefix_args = _get_shell()
+
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKSPACE,
-                           capture_output=True, text=True, timeout=120)
+        run_kwargs: dict[str, Any] = dict(
+            cwd=WORKSPACE,
+            capture_output=True,
+            timeout=120,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        if prefix_args:
+            r = subprocess.run(prefix_args + [command], **run_kwargs)
+        else:
+            r = subprocess.run(command, shell=True, **run_kwargs)
+
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
+    except FileNotFoundError:
+        return f"Error: Shell not found (platform={platform.system()})"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 def read_file(path: str, limit: int = None) -> str:
@@ -172,6 +270,30 @@ def _workspace_relative_path(path) -> str:
     return str(path.relative_to(WORKSPACE)).replace("\\", "/")
 
 
+def _matches_glob_ignore_case(value: str, pattern: str) -> bool:
+    return fnmatch.fnmatchcase(value.casefold(), pattern.casefold())
+
+
+_IGNORED_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".tox", ".eggs",
+    "dist", "build", "*.egg-info",
+}
+
+
+def _walk(root: Path, *, dirs: bool = True, files: bool = True):
+    """Yield paths under *root*, skipping common noise directories."""
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir():
+            if entry.name in _IGNORED_DIRS or entry.name.endswith(".egg-info"):
+                continue
+            if dirs:
+                yield entry
+            yield from _walk(entry, dirs=dirs, files=files)
+        elif files:
+            yield entry
+
+
 def glob(pattern: str, base_path: str = ".") -> str:
     try:
         if not str(pattern).strip():
@@ -181,9 +303,11 @@ def glob(pattern: str, base_path: str = ".") -> str:
         matches = sorted(
             [
                 _workspace_relative_path(path)
-                for path in root.rglob("*")
-                if fnmatch.fnmatch(path.name, pattern)
-                or fnmatch.fnmatch(str(path.relative_to(root)).replace("\\", "/"), pattern)
+                for path in _walk(root)
+                if _matches_glob_ignore_case(path.name, pattern)
+                or _matches_glob_ignore_case(
+                    str(path.relative_to(root)).replace("\\", "/"), pattern
+                )
             ]
         )
         if not matches:
@@ -209,9 +333,11 @@ def grep(
         regex = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
         results = []
 
-        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        for path in _walk(root, dirs=False):
             relative_to_root = str(path.relative_to(root)).replace("\\", "/")
-            if not fnmatch.fnmatch(path.name, file_pattern) and not fnmatch.fnmatch(
+            if not _matches_glob_ignore_case(
+                path.name, file_pattern
+            ) and not _matches_glob_ignore_case(
                 relative_to_root, file_pattern
             ):
                 continue
@@ -277,7 +403,7 @@ def build_builtin_tool_specs(
     skill_manager = skill_manager or SkillManager()
     tool_specs = [
         BuiltinToolSpec(
-            name="bash",
+            name="run_command",
             description="Run a shell command.",
             input_schema={
                 "type": "object",
@@ -289,7 +415,7 @@ def build_builtin_tool_specs(
                 },
                 "required": ["command"],
             },
-            handler=bash,
+            handler=run_command,
         ),
         BuiltinToolSpec(
             name="read_file",

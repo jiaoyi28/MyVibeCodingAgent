@@ -31,7 +31,9 @@ class SkillManager:
             logger.warning(f"Skills directory {self.skills_dir} not exists. Please check.")
             return
         logger.debug(f"Loading skills from {self.skills_dir}...")
-        for file in self.skills_dir.glob("*.md"):
+        for file in self.skills_dir.rglob("*.md"):
+            if file.name.lower() != "skill.md":
+                continue
             with open(file, "r", encoding="utf-8") as f:
                 text = f.read()
                 meta, body = self._parse_frontmatter(text)
