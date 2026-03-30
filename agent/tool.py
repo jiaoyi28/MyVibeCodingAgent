@@ -258,20 +258,23 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-def load_skill(name: str) -> str:
+def load_skill(name: str, skill_manager: SkillManager | None = None) -> str:
     if not str(name).strip():
         err = "load_skill: name is required"
         logger.error(err)
         return err
-    return SkillManager().get_content(name)
+    skill_manager = skill_manager or SkillManager()
+    return skill_manager.get_content(name)
 
 
 def build_builtin_tool_specs(
     *,
     todo_manager: ToDoManager | None = None,
+    skill_manager: SkillManager | None = None,
     spawn_exploration_subagent_handler: ToolHandler | None = None,
 ) -> list[BuiltinToolSpec]:
     todo_manager = todo_manager or ToDoManager()
+    skill_manager = skill_manager or SkillManager()
     tool_specs = [
         BuiltinToolSpec(
             name="bash",
@@ -449,7 +452,7 @@ def build_builtin_tool_specs(
                 },
                 "required": ["name"],
             },
-            handler=load_skill,
+            handler=lambda name: load_skill(name, skill_manager=skill_manager),
         ),
     ]
 
@@ -485,10 +488,12 @@ def register_builtin_tools(
     tool_manager: ToolManager,
     *,
     todo_manager: ToDoManager | None = None,
+    skill_manager: SkillManager | None = None,
     spawn_exploration_subagent_handler: ToolHandler | None = None,
 ):
     for spec in build_builtin_tool_specs(
         todo_manager=todo_manager,
+        skill_manager=skill_manager,
         spawn_exploration_subagent_handler=spawn_exploration_subagent_handler
     ):
         tool_manager.register(spec.build_tool(), spec.handler)

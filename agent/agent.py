@@ -10,6 +10,7 @@ from typing import Any, List
 from pathlib import Path
 from agent.tool import ToolManager, register_builtin_tools
 from agent.prompts import assemble_exploration_subagent_system_prompt, assemble_system_prompt
+from agent.skill import SkillManager
 
 PROJECT_ROOT = Path(__file__).parent.parent
 LOG_PATH = PROJECT_ROOT / "log.txt"
@@ -75,7 +76,10 @@ class LoopAgent:
         self.client = client
         self.tool_manager = tool_manager
         self.model = model
-        self.system_prompt = assemble_system_prompt()
+        self.skill_manager = SkillManager()
+        self.system_prompt = assemble_system_prompt(
+            skills_description=self.skill_manager.get_description()
+        )
         self.client_call_count = 0
         self._register_tools()
 
@@ -89,6 +93,7 @@ class LoopAgent:
     def _register_tools(self):
         register_builtin_tools(
             self.tool_manager,
+            skill_manager=self.skill_manager,
             spawn_exploration_subagent_handler=spawn_exploration_subagent,
         )
 

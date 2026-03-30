@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import agent.tool as tool_module
@@ -136,6 +137,18 @@ class ToolSearchTestCase(unittest.TestCase):
             tool_manager.execute("spawn_exploration_subagent", task="inspect", max_loop=3),
             "inspect:3",
         )
+
+    def test_register_builtin_tools_load_skill_uses_injected_skill_manager(self) -> None:
+        tool_manager = tool_module.ToolManager()
+        skill_manager = Mock()
+        skill_manager.get_content.return_value = "loaded skill"
+
+        tool_module.register_builtin_tools(tool_manager, skill_manager=skill_manager)
+
+        result = tool_manager.execute("load_skill", name="python")
+
+        self.assertEqual(result, "loaded skill")
+        skill_manager.get_content.assert_called_once_with("python")
 
 
 if __name__ == "__main__":
