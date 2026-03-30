@@ -74,6 +74,69 @@ class ToolSearchTestCase(unittest.TestCase):
 
         self.assertIn("Error: invalid regex pattern:", result)
 
+    def test_tool_manager_instances_are_isolated(self) -> None:
+        first = tool_module.ToolManager()
+        second = tool_module.ToolManager()
+
+        first.register(
+            tool_module.BuiltinToolSpec(
+                name="only_first",
+                description="first-only tool",
+                input_schema={"type": "object", "properties": {}, "required": []},
+                handler=lambda: "ok",
+            ).build_tool(),
+            lambda: "ok",
+        )
+
+        self.assertIsNot(first, second)
+        self.assertIn("only_first", first.tools)
+        self.assertNotIn("only_first", second.tools)
+
+    def test_todo_state_is_isolated_per_registered_tool_manager(self) -> None:
+        first = tool_module.ToolManager()
+        second = tool_module.ToolManager()
+
+        tool_module.register_builtin_tools(first)
+        tool_module.register_builtin_tools(second)
+
+        first_result = first.execute(
+            "todo",
+            items=[{"id": "1", "text": "first task", "status": "in_progress"}],
+        )
+        second_result = second.execute(
+            "todo",
+            items=[{"id": "2", "text": "second task", "status": "pending"}],
+        )
+
+        self.assertIn("first task", first_result)
+        self.assertNotIn("second task", first_result)
+        self.assertIn("second task", second_result)
+        self.assertNotIn("first task", second_result)
+
+    def test_register_builtin_tools_skips_subagent_without_handler(self) -> None:
+        tool_manager = tool_module.ToolManager()
+
+        tool_module.register_builtin_tools(tool_manager)
+
+        self.assertNotIn("spawn_exploration_subagent", tool_manager.tools)
+
+    def test_register_builtin_tools_includes_subagent_with_handler(self) -> None:
+        tool_manager = tool_module.ToolManager()
+
+        def fake_subagent_handler(task: str, max_loop: int = 10) -> str:
+            return f"{task}:{max_loop}"
+
+        tool_module.register_builtin_tools(
+            tool_manager,
+            spawn_exploration_subagent_handler=fake_subagent_handler,
+        )
+
+        self.assertIn("spawn_exploration_subagent", tool_manager.tools)
+        self.assertEqual(
+            tool_manager.execute("spawn_exploration_subagent", task="inspect", max_loop=3),
+            "inspect:3",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

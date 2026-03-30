@@ -16,18 +16,11 @@ ROLE_VISIBLE_TOOL_NAMES = {
 }
 
 class ToolManager:
-    _instance = None
-
     """tool管理"""
 
     def __init__(self) -> None:
-        self.tools = {}
-        self.tool_handlers = {}
-
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        self.tools: dict[str, Tool] = {}
+        self.tool_handlers: dict[str, ToolHandler] = {}
 
     def register(self, tool: Tool, tool_handler):
         self.tools[tool.name] = tool
@@ -93,9 +86,6 @@ class ToDoManager:
         done = sum(1 for t in self.todo_list if t["status"] == "completed")
         lines.append(f"\n({done}/{len(self.todo_list)} completed)")
         return "\n".join(lines)
-
-TO_DO_MANAGER = ToDoManager()
-
 
 ToolHandler = Callable[..., str]
 
@@ -268,25 +258,6 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-def spawn_exploration_subagent(task: str, max_loop: int = 10) -> str:
-    if not str(task).strip():
-        return "Error: task is required"
-    if max_loop < 1:
-        return "Error: max_loop must be at least 1"
-
-    try:
-        from agent.agent import ExplorationSubAgent, client
-
-        tool_manager = ToolManager()
-        subagent = ExplorationSubAgent(client, tool_manager)
-        return subagent.invoke(
-            messages=[{"role": "user", "content": task}],
-            max_loop=max_loop,
-        )
-    except Exception as e:
-        return f"Error: {e}"
-
-
 def load_skill(name: str) -> str:
     if not str(name).strip():
         err = "load_skill: name is required"
@@ -295,209 +266,229 @@ def load_skill(name: str) -> str:
     return SkillManager().get_content(name)
 
 
-TOOL_SPECS = [
-    BuiltinToolSpec(
-        name="bash",
-        description="Run a shell command.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The command to run.",
-                }
+def build_builtin_tool_specs(
+    *,
+    todo_manager: ToDoManager | None = None,
+    spawn_exploration_subagent_handler: ToolHandler | None = None,
+) -> list[BuiltinToolSpec]:
+    todo_manager = todo_manager or ToDoManager()
+    tool_specs = [
+        BuiltinToolSpec(
+            name="bash",
+            description="Run a shell command.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The command to run.",
+                    }
+                },
+                "required": ["command"],
             },
-            "required": ["command"],
-        },
-        handler=bash,
-    ),
-    BuiltinToolSpec(
-        name="read_file",
-        description="Read file contents.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The path of the file to read.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Optional max number of lines to read.",
-                    "minimum": 1,
-                },
-            },
-            "required": ["path"],
-        },
-        handler=read_file,
-    ),
-    BuiltinToolSpec(
-        name="glob",
-        description="Find files by glob pattern.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Glob pattern to match files, such as '*.py' or 'agent/*.py'.",
-                },
-                "base_path": {
-                    "type": "string",
-                    "description": "Optional base directory to search from.",
-                    "default": ".",
-                },
-            },
-            "required": ["pattern"],
-        },
-        handler=glob,
-    ),
-    BuiltinToolSpec(
-        name="grep",
-        description="Search file contents with a regex pattern.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex pattern to search for.",
-                },
-                "base_path": {
-                    "type": "string",
-                    "description": "Optional base directory to search from.",
-                    "default": ".",
-                },
-                "file_pattern": {
-                    "type": "string",
-                    "description": "Optional glob for files to include, such as '*.py'.",
-                    "default": "*",
-                },
-                "case_sensitive": {
-                    "type": "boolean",
-                    "description": "Whether the regex search is case-sensitive.",
-                    "default": False,
-                },
-            },
-            "required": ["pattern"],
-        },
-        handler=grep,
-    ),
-    BuiltinToolSpec(
-        name="write_file",
-        description="Write content to file.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The path of the file to write.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write.",
-                },
-            },
-            "required": ["path", "content"],
-        },
-        handler=write_file,
-    ),
-    BuiltinToolSpec(
-        name="edit_file",
-        description="Replace exact text in file.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The path of the file to edit.",
-                },
-                "old_text": {
-                    "type": "string",
-                    "description": "The exact text to replace.",
-                },
-                "new_text": {
-                    "type": "string",
-                    "description": "The replacement text.",
-                },
-            },
-            "required": ["path", "old_text", "new_text"],
-        },
-        handler=edit_file,
-    ),
-    BuiltinToolSpec(
-        name="todo",
-        description="Update task list. Track progress on multi-step tasks.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "description": "The todo items to manage.",
-                    "items": {
-                        "type": "object",
-                        "description": "A todo item.",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "The todo item id.",
-                            },
-                            "text": {
-                                "type": "string",
-                                "description": "The todo item text.",
-                            },
-                            "status": {
-                                "type": "string",
-                                "description": "The todo item status.",
-                                "enum": ["pending", "in_progress", "completed"],
-                            },
-                        },
-                        "required": ["text"],
+            handler=bash,
+        ),
+        BuiltinToolSpec(
+            name="read_file",
+            description="Read file contents.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the file to read.",
                     },
-                    "maxItems": 10,
-                }
-            },
-            "required": ["items"],
-        },
-        handler=TO_DO_MANAGER.update,
-    ),
-    BuiltinToolSpec(
-        name="spawn_exploration_subagent",
-        description="Spawn an exploration subagent for read-only research and return its summary.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "The exploration task to delegate.",
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional max number of lines to read.",
+                        "minimum": 1,
+                    },
                 },
-                "max_loop": {
-                    "type": "integer",
-                    "description": "Optional max model-call loops for the subagent.",
-                    "minimum": 1,
-                    "default": 10,
+                "required": ["path"],
+            },
+            handler=read_file,
+        ),
+        BuiltinToolSpec(
+            name="glob",
+            description="Find files by glob pattern.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to match files, such as '*.py' or 'agent/*.py'.",
+                    },
+                    "base_path": {
+                        "type": "string",
+                        "description": "Optional base directory to search from.",
+                        "default": ".",
+                    },
                 },
+                "required": ["pattern"],
             },
-            "required": ["task"],
-        },
-        handler=spawn_exploration_subagent,
-    ),
-    BuiltinToolSpec(
-        name="load_skill",
-        description="Load specialized skill and knowledge by name.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The name of the skill to load.",
-                }
+            handler=glob,
+        ),
+        BuiltinToolSpec(
+            name="grep",
+            description="Search file contents with a regex pattern.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for.",
+                    },
+                    "base_path": {
+                        "type": "string",
+                        "description": "Optional base directory to search from.",
+                        "default": ".",
+                    },
+                    "file_pattern": {
+                        "type": "string",
+                        "description": "Optional glob for files to include, such as '*.py'.",
+                        "default": "*",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Whether the regex search is case-sensitive.",
+                        "default": False,
+                    },
+                },
+                "required": ["pattern"],
             },
-            "required": ["name"],
-        },
-        handler=load_skill
-    )
-]
+            handler=grep,
+        ),
+        BuiltinToolSpec(
+            name="write_file",
+            description="Write content to file.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the file to write.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write.",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+            handler=write_file,
+        ),
+        BuiltinToolSpec(
+            name="edit_file",
+            description="Replace exact text in file.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The path of the file to edit.",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "The exact text to replace.",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "The replacement text.",
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+            handler=edit_file,
+        ),
+        BuiltinToolSpec(
+            name="todo",
+            description="Update task list. Track progress on multi-step tasks.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "The todo items to manage.",
+                        "items": {
+                            "type": "object",
+                            "description": "A todo item.",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "The todo item id.",
+                                },
+                                "text": {
+                                    "type": "string",
+                                    "description": "The todo item text.",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "description": "The todo item status.",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                },
+                            },
+                            "required": ["text"],
+                        },
+                        "maxItems": 10,
+                    },
+                },
+                "required": ["items"],
+            },
+            handler=todo_manager.update,
+        ),
+        BuiltinToolSpec(
+            name="load_skill",
+            description="Load specialized skill and knowledge by name.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the skill to load.",
+                    }
+                },
+                "required": ["name"],
+            },
+            handler=load_skill,
+        ),
+    ]
+
+    if spawn_exploration_subagent_handler is not None:
+        tool_specs.append(
+            BuiltinToolSpec(
+                name="spawn_exploration_subagent",
+                description="Spawn an exploration subagent for read-only research and return its summary.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The exploration task to delegate.",
+                        },
+                        "max_loop": {
+                            "type": "integer",
+                            "description": "Optional max model-call loops for the subagent.",
+                            "minimum": 1,
+                            "default": 10,
+                        },
+                    },
+                    "required": ["task"],
+                },
+                handler=spawn_exploration_subagent_handler,
+            )
+        )
+
+    return tool_specs
 
 
-def register_builtin_tools(tool_manager: ToolManager):
-    for spec in TOOL_SPECS:
+def register_builtin_tools(
+    tool_manager: ToolManager,
+    *,
+    todo_manager: ToDoManager | None = None,
+    spawn_exploration_subagent_handler: ToolHandler | None = None,
+):
+    for spec in build_builtin_tool_specs(
+        todo_manager=todo_manager,
+        spawn_exploration_subagent_handler=spawn_exploration_subagent_handler
+    ):
         tool_manager.register(spec.build_tool(), spec.handler)

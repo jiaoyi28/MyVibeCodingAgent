@@ -87,7 +87,10 @@ class LoopAgent:
         return ResponsesOutputLoopAgent(client, tool_manager)
 
     def _register_tools(self):
-        register_builtin_tools(self.tool_manager)
+        register_builtin_tools(
+            self.tool_manager,
+            spawn_exploration_subagent_handler=spawn_exploration_subagent,
+        )
 
     def _next_client_call_count(self) -> int:
         self.client_call_count += 1
@@ -335,6 +338,23 @@ class ExplorationSubAgent(ChatCompletionLoopAgent):
 
     def invoke(self, messages: List, max_loop = 10) -> str:
         return self._agent_loop(messages, max_loop=max_loop)
+
+
+def spawn_exploration_subagent(task: str, max_loop: int = 10) -> str:
+    if not str(task).strip():
+        return "Error: task is required"
+    if max_loop < 1:
+        return "Error: max_loop must be at least 1"
+
+    try:
+        tool_manager = ToolManager()
+        subagent = ExplorationSubAgent(client, tool_manager)
+        return subagent.invoke(
+            messages=[{"role": "user", "content": task}],
+            max_loop=max_loop,
+        )
+    except Exception as e:
+        return f"Error: {e}"
 
 
 if __name__ == "__main__":
