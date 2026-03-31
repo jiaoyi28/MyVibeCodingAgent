@@ -273,7 +273,7 @@ dependencies = [
 requires-dist = [
     { name = "openai", specifier = "==2.29.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
-    { name = "transformers" },
+    { name = "transformers", specifier = "==5.4.0" },
 ]
 
 [[package]]

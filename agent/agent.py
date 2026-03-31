@@ -5,6 +5,7 @@ import httpx
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any, List
 from pathlib import Path
@@ -63,8 +64,13 @@ client = OpenAI(
     max_retries=max_retries,
 )
 
+def _build_agent_id(prefix: str) -> str:
+    normalized_prefix = str(prefix).strip() or "agent"
+    return f"{normalized_prefix}_{secrets.token_hex(8)}"
+
 class LoopAgent:
     role = "main_agent"
+    agent_id_prefix = "main_agent"
     """
     提供统一的对外入口：`agent_loop(messages)`。
     内部通过子类实现不同的调用形态：
@@ -72,9 +78,15 @@ class LoopAgent:
     - `responses`：基于 previous_response_id 串联 function_call_output
     """
 
-    def __init__(self, client: OpenAI, tool_manager: ToolManager):
+    def __init__(
+        self,
+        client: OpenAI,
+        tool_manager: ToolManager,
+        agent_id: str | None = None,
+    ):
         self.client = client
         self.tool_manager = tool_manager
+        self.agent_id = agent_id or _build_agent_id(self.agent_id_prefix)
         self.model = model
         self.skill_manager = SkillManager()
         self.system_prompt = assemble_system_prompt(
@@ -82,19 +94,35 @@ class LoopAgent:
         )
         self.client_call_count = 0
         self._register_tools()
+        logger.info(
+            "Agent initialized | agent_id=%s | role=%s",
+            self.agent_id,
+            self.role,
+            extra={"send_to_terminal": False},
+        )
 
     @classmethod
-    def create(cls, client: OpenAI, tool_manager: ToolManager, agent_loop_backend="chat") -> "LoopAgent":
+    def create(
+        cls,
+        client: OpenAI,
+        tool_manager: ToolManager,
+        agent_loop_backend="chat",
+        agent_id: str | None = None,
+    ) -> "LoopAgent":
         # 三方兼容的 base_url 通常更容易兼容 chat.completions，而不一定兼容 responses。
         if agent_loop_backend == "chat":
-            return ChatCompletionLoopAgent(client, tool_manager)
-        return ResponsesOutputLoopAgent(client, tool_manager)
+            return ChatCompletionLoopAgent(client, tool_manager, agent_id=agent_id)
+        return ResponsesOutputLoopAgent(client, tool_manager, agent_id=agent_id)
 
     def _register_tools(self):
         register_builtin_tools(
             self.tool_manager,
             skill_manager=self.skill_manager,
-            spawn_exploration_subagent_handler=spawn_exploration_subagent,
+            spawn_exploration_subagent_handler=lambda task, max_loop=10: spawn_exploration_subagent(
+                task,
+                max_loop=max_loop,
+                parent_agent_id=self.agent_id,
+            ),
         )
 
     def _next_client_call_count(self) -> int:
@@ -115,7 +143,9 @@ class LoopAgent:
 
     def _log_model_request(self, api_name: str, call_count: int, payload: dict) -> None:
         logger.debug(
-            "Model request | api=%s | attempt=%s | payload=%s",
+            "Model request | agent_id=%s | role=%s | api=%s | attempt=%s | payload=%s",
+            self.agent_id,
+            self.role,
             api_name,
             call_count,
             self._serialize_for_log(payload),
@@ -126,7 +156,9 @@ class LoopAgent:
     ) -> None:
         elapsed_ms = (time.perf_counter() - started_at) * 1000
         logger.debug(
-            "Model response | api=%s | attempt=%s | elapsed_ms=%.2f | payload=%s",
+            "Model response | agent_id=%s | role=%s | api=%s | attempt=%s | elapsed_ms=%.2f | payload=%s",
+            self.agent_id,
+            self.role,
             api_name,
             call_count,
             elapsed_ms,
@@ -135,13 +167,15 @@ class LoopAgent:
 
     def _log_tool_call(self, tool_name: str, tool_args: Any, result: str) -> None:
         logger.info(
-            "Tool call | name=%s | input=%s | output=%s",
+            "Tool call | agent_id=%s | role=%s | name=%s | input=%s | output=%s",
+            self.agent_id,
+            self.role,
             tool_name,
             self._serialize_for_log(tool_args),
             self._serialize_for_log(result),
             extra={"send_to_terminal": False},
         )
-        terminal_logger.info(">%s: %s", tool_name, result)
+        terminal_logger.info("[%s] >%s: %s", self.agent_id, tool_name, result)
 
     def _parse_tool_arguments(self, arguments: Any) -> dict:
         if isinstance(arguments, dict):
@@ -336,16 +370,26 @@ class ResponsesOutputLoopAgent(LoopAgent):
 
 class ExplorationSubAgent(ChatCompletionLoopAgent):
     role = "sub_agent"
+    agent_id_prefix = "exploration_subagent"
 
-    def __init__(self, client: OpenAI, tool_manager: ToolManager):
-        super().__init__(client, tool_manager)
+    def __init__(
+        self,
+        client: OpenAI,
+        tool_manager: ToolManager,
+        agent_id: str | None = None,
+    ):
+        super().__init__(client, tool_manager, agent_id=agent_id)
         self.system_prompt = assemble_exploration_subagent_system_prompt()
 
     def invoke(self, messages: List, max_loop = 10) -> str:
         return self._agent_loop(messages, max_loop=max_loop)
 
 
-def spawn_exploration_subagent(task: str, max_loop: int = 10) -> str:
+def spawn_exploration_subagent(
+    task: str,
+    max_loop: int = 10,
+    parent_agent_id: str | None = None,
+) -> str:
     if not str(task).strip():
         return "Error: task is required"
     if max_loop < 1:
@@ -354,6 +398,12 @@ def spawn_exploration_subagent(task: str, max_loop: int = 10) -> str:
     try:
         tool_manager = ToolManager()
         subagent = ExplorationSubAgent(client, tool_manager)
+        logger.info(
+            "Spawn exploration subagent | parent_agent_id=%s | subagent_id=%s",
+            parent_agent_id,
+            subagent.agent_id,
+            extra={"send_to_terminal": False},
+        )
         return subagent.invoke(
             messages=[{"role": "user", "content": task}],
             max_loop=max_loop,
